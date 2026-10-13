@@ -63,9 +63,10 @@ jobs:
         run: |
           OUT=tool/encode/pyro_session.session
           K=$(printf '%s' "$ENCODE_TOKEN" | tr -d '[:space:]')
-          # Shu sifat uchun alohida sessiya bo'lsa (`session_480.enc`) — o'sha, bo'lmasa umumiy.
-          SRC=tool/encode/session.enc
-          [ -f tool/encode/session_480.enc ] && SRC=tool/encode/session_480.enc
+          # Har sifat-workflow'ning O'Z sessiyasi bor (`session_480.enc`, botdagi "🔑 Yangi sessiya" bo'limi yaratadi).
+          # Sessiyasiz workflow ishga tushmaydi.
+          SRC=tool/encode/session_480.enc
+          [ -f "$SRC" ] || { echo "::error::480p uchun Telegram sessiyasi yo'q ($SRC) — botda 'Yangi sessiya' orqali ulang"; exit 1; }
           K="$K" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:K \
             -in "$SRC" -out "$OUT"
           head -c 16 "$OUT" | grep -q "SQLite format 3" || { echo "::error::Sessiya ochilmadi (ENCODE_TOKEN noto'g'ri?)"; exit 1; }
@@ -81,8 +82,7 @@ jobs:
           ENCODE_QUALITY: '480p'
           H265_CRF: '30'
           H265_PRESET: medium
-          # Log kanali va qadalgan holat xabari FAQAT 360p workflow'da (4 ta run bir xabarni tahrirlamasin);
-          # qolganlarning holati worker'ga yuboriladi (admin paneli va bot hammasini ko'radi).
+          # Har sifatning o'z log kanali bor (`run.py` -> QUALITY_LOG_CHANNELS); u yerga run o'z xabarini yuboradi.
           LOG_CHANNEL_ID: '0'
           START_BUDGET_MIN: '240'
           PYTHONUNBUFFERED: '1'
