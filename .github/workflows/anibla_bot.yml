@@ -1,0 +1,53 @@
+name: Anibla -> aniraxuzbot (bitta qism)
+
+# aniraxuzbot ("➕ Yangi qism qo'shish" -> "🌐 Anibla orqali"): BITTA Actions run = BITTA to'liq qism. Bir vaqtda faqat bitta run ishlaydi.
+# Run ishga tushgach botdan navbatdagi ENG ESKI qismning hamma sifatini oladi va 360p dan boshlab birin-ketin tayyorlaydi
+# (`tool/anibla/bot_download.py`): yuklaydi, 2 GB dan kattasini aniq o'lchab qismlarga bo'ladi, har tayyor faylni R2'ga yozadi.
+# R2 yuklovchisi (`upload.yml`, qo'shimcha akkauntlar) R2'dan olib BOTGA yuboradi; bot kanalga saqlab bazaga yozadi.
+# Run'ni bot o'zi ishga tushiradi (`workflow_dispatch`, kirish parametrlarisiz).
+#
+# Bu fayl ARUMEDIATV repodagi `tool/anibla/anibla_bot.workflow.yml` dan ko'chiriladi (`sync-packs.yml`) — shu yerda o'zgartirmang.
+
+on:
+  workflow_dispatch:
+
+run-name: "Anibla · bitta qism (navbat)"
+
+concurrency:
+  group: aniraxuzbot-anibla
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python paketlari
+        run: pip install --no-cache-dir -r tool/encode/requirements.txt
+
+      - name: Katta fayllar uchun joy (/mnt dagi katta disk)
+        run: |
+          sudo mkdir -p /mnt/anibla && sudo chown "$USER" /mnt/anibla
+          df -h /mnt/anibla | tail -1
+
+      - name: Qismni tayyorlash va R2'ga yozish
+        env:
+          API: https://aniraxuzbot.uzcom.workers.dev
+          RUN_KEY: ${{ secrets.ENCODE_TOKEN }}
+          ENCODE_TOKEN: ${{ secrets.ENCODE_TOKEN }}
+          API_BASE: ${{ secrets.API_BASE || 'https://arumediatv.uzcom.workers.dev' }}
+          WORK_ROOT: /mnt/anibla
+          PYTHONUNBUFFERED: '1'
+        run: python3 tool/anibla/bot_download.py
