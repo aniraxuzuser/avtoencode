@@ -1,0 +1,42 @@
+# UZ: Ikkinchi GitHub akkauntdagi (YOPIQ) repoga `.github/workflows/ytjob.yml` sifatida qo'yiladi. Ample (`ytbot`) shu workflow'ni `workflow_dispatch` bilan ishga tushiradi. `setup_repo.py` uni avtoencode repoga o'zi qo'yadi (secret `ENCODE_TOKEN` shu repoda bor).
+# EN: Put this into the (PRIVATE) repo of the second GitHub account as `.github/workflows/ytjob.yml`. Ample (`ytbot`) triggers it with `workflow_dispatch`.
+name: ytjob
+run-name: "ytjob #${{ inputs.job }}"
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Ish raqami / Job id"
+        required: true
+      cb:
+        description: "Ample manzili / Ample base URL"
+        required: true
+      etok:
+        description: "Shifrlangan bir martalik kalit / Encrypted one-time key"
+        required: true
+permissions: {}
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Asboblar (ffmpeg, yt-dlp)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o yt-dlp
+          chmod +x yt-dlp && sudo mv yt-dlp /usr/local/bin/
+          mkdir -p ~/.config/yt-dlp && echo "--js-runtimes node" > ~/.config/yt-dlp/config
+      - name: Ish (yuklash, bo'lish, yuborish; log har soniyada Ample'ga)
+        env:
+          CB: ${{ inputs.cb }}
+          JOB: ${{ inputs.job }}
+          ETOK: ${{ inputs.etok }}
+          K: ${{ secrets.ENCODE_TOKEN }}
+        run: |
+          # Kalit shifrlangan keladi (repo ochiq bo'lsa ham ko'rinmaydi): ENCODE_TOKEN bilan ochamiz va logda yashiramiz.
+          TOK=$(printf '%s' "$ETOK" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -a -A -pass env:K)
+          echo "::add-mask::$TOK"
+          export TOK
+          curl -fsSL -H "Authorization: Bearer $TOK" "$CB/bin?job=$JOB" -o ytbot
+          chmod +x ytbot
+          ./ytbot ajob
