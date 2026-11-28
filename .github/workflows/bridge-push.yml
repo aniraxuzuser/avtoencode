@@ -1,0 +1,58 @@
+name: Bridge — kodni boshqa repoga yuborish
+
+# `bridge/go.trigger` o'zgarganda ishlaydi: `bridge/pat.enc` (ochiq kalit bilan shifrlangan token) maxfiy kalit
+# (`bridge/key.enc`, ENCODE_TOKEN bilan ochiladi) yordamida ochiladi, `bridge/patches/*.patch` nishon repoga qo'llanib, `main`ga yuboriladi.
+# Natija (token'siz) `bridge/status.txt` ga yoziladi, `pat.enc` o'chiriladi.
+on:
+  push:
+    paths: ['bridge/go.trigger']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bridge
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ENCODE_TOKEN: ${{ secrets.ENCODE_TOKEN }}
+      TARGET: ogabekraximov650-del/ARUGRAM
+    steps:
+      - uses: actions/checkout@v4
+      - name: Yuborish
+        run: |
+          set +x
+          ST="$PWD/bridge/status.txt"
+          : > "$ST"
+          say() { echo "$*" | sed -E 's#(ghp_|github_pat_)[A-Za-z0-9_]+#***#g;s#://[^@ ]*@#://***@#g' >> "$ST"; }
+          K=$(printf '%s' "$ENCODE_TOKEN" | tr -d '[:space:]')
+          [ -f bridge/pat.enc ] || { say "XATO: pat.enc yo'q"; exit 0; }
+          K="$K" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:K -in bridge/key.enc -out /tmp/k.pem 2>/dev/null || { say "XATO: maxfiy kalit ochilmadi"; exit 0; }
+          openssl pkeyutl -decrypt -inkey /tmp/k.pem -pkeyopt rsa_padding_mode:oaep -in bridge/pat.enc -out /tmp/pat 2>/dev/null || { say "XATO: token ochilmadi"; rm -f /tmp/k.pem; exit 0; }
+          PAT=$(tr -d '[:space:]' < /tmp/pat)
+          echo "::add-mask::$PAT"
+          rm -f /tmp/k.pem /tmp/pat
+          URL="https://x-access-token:${PAT}@github.com/${TARGET}.git"
+          if ! git clone --quiet "$URL" /tmp/target 2>/tmp/err; then say "XATO klon: $(tail -2 /tmp/err)"; exit 0; fi
+          cd /tmp/target
+          git config user.name "bridge"
+          git config user.email "bridge@users.noreply.github.com"
+          n=0
+          for p in "$GITHUB_WORKSPACE"/bridge/patches/*.patch; do
+            [ -f "$p" ] || continue
+            if git am --3way "$p" >/tmp/am 2>&1; then n=$((n+1)); else say "XATO patch $(basename "$p"): $(tail -3 /tmp/am)"; git am --abort 2>/dev/null; exit 0; fi
+          done
+          if git push --quiet "$URL" HEAD:main 2>/tmp/err; then say "OK: $n ta patch yuborildi, $(git log --oneline -1)"; else say "XATO push: $(tail -3 /tmp/err)"; fi
+      - name: Natijani saqlash
+        if: always()
+        run: |
+          git config user.name "bridge"
+          git config user.email "bridge@users.noreply.github.com"
+          git rm -q --ignore-unmatch bridge/pat.enc
+          git add bridge/status.txt
+          git commit -m "bridge: natija" || true
+          git push

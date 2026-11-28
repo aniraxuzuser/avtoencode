@@ -1,0 +1,45 @@
+name: Bridge — kalit yaratish (bir marta)
+
+# `bridge/setup.trigger` o'zgarganda ishlaydi: RSA kalit juftligi yaratadi. Ochiq kalit `bridge/pub.pem`,
+# maxfiy kalit ENCODE_TOKEN bilan shifrlangan holda `bridge/key.enc` da. Natija `bridge/status.txt` ga yoziladi.
+on:
+  push:
+    paths: ['bridge/setup.trigger']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bridge
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ENCODE_TOKEN: ${{ secrets.ENCODE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kalit juftligi
+        run: |
+          mkdir -p bridge
+          K=$(printf '%s' "$ENCODE_TOKEN" | tr -d '[:space:]')
+          if [ -z "$K" ]; then
+            echo "XATO: ENCODE_TOKEN sirri yo'q" > bridge/status.txt
+          elif [ -f bridge/pub.pem ] && [ -f bridge/key.enc ]; then
+            echo "tayyor (oldindan) $(date -u +%FT%TZ)" > bridge/status.txt
+          else
+            openssl genrsa -out /tmp/k.pem 3072 2>/dev/null
+            openssl rsa -in /tmp/k.pem -pubout -out bridge/pub.pem 2>/dev/null
+            K="$K" openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:K -in /tmp/k.pem -out bridge/key.enc
+            rm -f /tmp/k.pem
+            echo "tayyor $(date -u +%FT%TZ)" > bridge/status.txt
+          fi
+      - name: Natijani saqlash
+        run: |
+          git config user.name "bridge"
+          git config user.email "bridge@users.noreply.github.com"
+          git add bridge/pub.pem bridge/key.enc bridge/status.txt 2>/dev/null || git add bridge/status.txt
+          git commit -m "bridge: kalit holati" || true
+          git push
