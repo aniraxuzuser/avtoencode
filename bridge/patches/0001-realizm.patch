@@ -1,0 +1,1375 @@
+From 239ea256d71e960e526ea7bcac0bf09f00cc75c6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 28 Nov 2026 14:48:39 +0000
+Subject: [PATCH] GigaCraft realizm: teksturalar, suv to'lqini, bulutlar,
+ haqiqiy quyosh va fasllar, muhit tovushlari, iqlimga mos hayvonlar,
+ chidamlilik va qiyalik
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FQzWXip443pqVDXS3Q7Tmi
+---
+ ARUmultiplatform/gigacraft/src/app.rs     |  11 +-
+ ARUmultiplatform/gigacraft/src/audio.rs   |  93 +++++++++-
+ ARUmultiplatform/gigacraft/src/entity.rs  |  58 +++++-
+ ARUmultiplatform/gigacraft/src/game.rs    | 215 +++++++++++++++++++++-
+ ARUmultiplatform/gigacraft/src/lod.rs     |   5 +-
+ ARUmultiplatform/gigacraft/src/mesh.rs    |  10 +-
+ ARUmultiplatform/gigacraft/src/player.rs  | 116 +++++++++++-
+ ARUmultiplatform/gigacraft/src/render.rs  | 159 +++++++++++++++-
+ ARUmultiplatform/gigacraft/src/sky.rs     |  81 +++++++-
+ ARUmultiplatform/gigacraft/src/ui.rs      |  22 ++-
+ ARUmultiplatform/gigacraft/tests/shots.rs |   2 +-
+ KEYINGI_VAZIFA.md                         |  10 +
+ 12 files changed, 739 insertions(+), 43 deletions(-)
+
+diff --git a/ARUmultiplatform/gigacraft/src/app.rs b/ARUmultiplatform/gigacraft/src/app.rs
+index fd76e91a6..842dd00b1 100644
+--- a/ARUmultiplatform/gigacraft/src/app.rs
++++ b/ARUmultiplatform/gigacraft/src/app.rs
+@@ -59,6 +59,7 @@ pub struct App {
+     started: Instant,
+     pub fov: f32,
+     slot: u8,
++    clock: f32,
+     /// Hozir faol bo'lmagan o'lchamning blok tahrirlari.
+     edits_other: Vec<u8>,
+     workers: usize,
+@@ -139,6 +140,7 @@ impl App {
+             started: Instant::now(),
+             fov: 1.15,
+             slot,
++            clock: 0.0,
+             edits_other,
+             workers,
+         })
+@@ -446,6 +448,7 @@ impl App {
+     /// Mantiq va oqim (chizmasdan). Testlarda tez yuklash uchun alohida.
+     pub fn step(&mut self, w: i32, h: i32, dt: f32) {
+         self.game.resize(w as f32, h as f32);
++        self.clock = (self.clock + dt) % 100_000.0;
+         if dt > 0.0 {
+             self.game.fps = if self.game.fps == 0.0 { 1.0 / dt } else { self.game.fps * 0.92 + 0.08 / dt };
+         }
+@@ -467,6 +470,8 @@ impl App {
+             crate::audio::play(s);
+         }
+         crate::audio::set_rain(self.game.rain);
++        let a = self.game.ambient;
++        crate::audio::set_ambient(a[0], a[1], a[2], a[3]);
+         crate::audio::set_music(self.game.mode == Mode::Play);
+         self.since_save += dt;
+         if self.since_save > 30.0 {
+@@ -479,7 +484,8 @@ impl App {
+         let ready = self.game.loading >= 1.0;
+         let pl = &self.game.player;
+         let up = d_f32(pl.up());
+-        let sky_state = if self.game.dim == 1 { sky::airless(sky::state(self.game.time, up)) } else { sky::overcast(sky::state(self.game.time, up), self.game.rain) };
++        let st = sky::state_at(self.game.time, up, self.game.decl());
++        let sky_state = if self.game.dim == 1 { sky::airless(st) } else { sky::overcast(st, self.game.rain) };
+         let alt = pl.altitude().max(0.0);
+         let horizon = self.horizon();
+         let (r, cu, f) = pl.camera_basis();
+@@ -495,6 +501,9 @@ impl App {
+             h,
+             near: near_plane(pl.agl),
+             far: (horizon * 1.3 + 8000.0) as f32,
++            time: self.clock,
++            cover: if self.game.dim == 1 { 0.0 } else { (0.30 + self.game.rain * 0.55).min(1.0) },
++            season: self.game.season_tint(),
+         };
+         let meshes: Vec<&GpuMesh> = self
+             .scene
+diff --git a/ARUmultiplatform/gigacraft/src/audio.rs b/ARUmultiplatform/gigacraft/src/audio.rs
+index e0cfe3b0e..1b8e50286 100644
+--- a/ARUmultiplatform/gigacraft/src/audio.rs
++++ b/ARUmultiplatform/gigacraft/src/audio.rs
+@@ -16,6 +16,13 @@ pub enum Sfx {
+     Groan,
+     Craft,
+     Moo,
++    StepGrass,
++    StepSand,
++    StepStone,
++    StepSnow,
++    StepWood,
++    Splash,
++    Chirp,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -38,6 +45,16 @@ pub struct Synth {
+     lp: f32,
+     next_note: f32,
+     note_v: Vec<Voice>,
++    /// Muhit tovushlari: shamol, suv, qushlar, chirildoq (har biri [0,1]).
++    pub wind: f32,
++    pub water: f32,
++    pub birds: f32,
++    pub crickets: f32,
++    lp_w: f32,
++    lp_r: f32,
++    lfo: f32,
++    bird_t: u32,
++    cr_t: f32,
+ }
+ 
+ impl Default for Synth {
+@@ -48,7 +65,7 @@ impl Default for Synth {
+ 
+ impl Synth {
+     pub fn new() -> Synth {
+-        Synth { voices: Vec::new(), rng: 0x9E37_79B9, rain: 0.0, music: true, mt: 0.0, lp: 0.0, next_note: 3.0, note_v: Vec::new() }
++        Synth { voices: Vec::new(), rng: 0x9E37_79B9, rain: 0.0, music: true, mt: 0.0, lp: 0.0, next_note: 3.0, note_v: Vec::new(), wind: 0.0, water: 0.0, birds: 0.0, crickets: 0.0, lp_w: 0.0, lp_r: 0.0, lfo: 0.0, bird_t: 0, cr_t: 0.0 }
+     }
+ 
+     fn noise(&mut self) -> f32 {
+@@ -71,6 +88,13 @@ impl Synth {
+             Sfx::Groan => vec![v(95.0, -25.0, 0.1, 0.45, 2.5), v(142.0, -30.0, 0.1, 0.3, 2.5)],
+             Sfx::Craft => vec![v(520.0, 300.0, 0.0, 0.25, 7.0), v(780.0, 300.0, 0.0, 0.15, 7.0)],
+             Sfx::Moo => vec![v(130.0, 30.0, 0.05, 0.4, 1.6)],
++            Sfx::StepGrass => vec![v(110.0, -50.0, 0.85, 0.10, 26.0)],
++            Sfx::StepSand => vec![v(60.0, 0.0, 1.0, 0.13, 16.0)],
++            Sfx::StepStone => vec![v(240.0, -120.0, 0.55, 0.20, 40.0)],
++            Sfx::StepSnow => vec![v(70.0, 0.0, 1.0, 0.16, 12.0), v(75.0, 0.0, 1.0, 0.0, 12.0)],
++            Sfx::StepWood => vec![v(150.0, -60.0, 0.30, 0.24, 30.0)],
++            Sfx::Splash => vec![v(300.0, -200.0, 0.9, 0.22, 7.0)],
++            Sfx::Chirp => vec![v(3400.0, 900.0, 0.0, 0.05, 28.0)],
+         };
+         for x in list {
+             if self.voices.len() < 24 {
+@@ -88,6 +112,13 @@ impl Synth {
+             let mut i = 0;
+             while i < self.voices.len() {
+                 let mut vc = self.voices[i];
++                if vc.t < 0.0 {
++                    // hali boshlanmagan (kechikkan) ovoz
++                    vc.t += dt;
++                    self.voices[i] = vc;
++                    i += 1;
++                    continue;
++                }
+                 let env = (-vc.t * vc.decay).exp();
+                 if env < 0.004 {
+                     self.voices.swap_remove(i);
+@@ -111,6 +142,35 @@ impl Synth {
+                 self.lp += (n - self.lp) * 0.25;
+                 sum += self.lp * 0.22 * self.rain;
+             }
++            // Muhit: shamol (past chastotali shovqin, sekin to'lqinlanadi) va suv shovqini
++            if self.wind > 0.01 {
++                self.lfo += dt * 0.35;
++                let n = self.noise();
++                self.lp_w += (n - self.lp_w) * 0.035;
++                sum += self.lp_w * 0.55 * self.wind * (0.65 + 0.35 * (self.lfo * std::f32::consts::TAU).sin());
++            }
++            if self.water > 0.01 {
++                let n = self.noise();
++                self.lp_r += (n - self.lp_r) * 0.30;
++                sum += (n - self.lp_r) * 0.07 * self.water;
++            }
++            if self.birds > 0.01 {
++                self.bird_t += 1;
++                if self.bird_t >= 2205 {
++                    self.bird_t = 0;
++                    if (self.noise() + 1.0) * 0.5 < self.birds * 0.04 && self.voices.len() < 20 {
++                        let f0 = 2600.0 + (self.noise() + 1.0) * 900.0;
++                        for k in 0..3 {
++                            self.voices.push(Voice { f: f0 + k as f32 * 150.0, slide: 700.0, noise: 0.0, amp: 0.05 * (1.0 - k as f32 * 0.25), decay: 24.0 + k as f32 * 4.0, t: -(k as f32) * 0.09, phase: 0.0 });
++                        }
++                    }
++                }
++            }
++            if self.crickets > 0.01 {
++                self.cr_t += dt;
++                let gate = if (self.cr_t * 7.0).fract() < 0.4 { 1.0 } else { 0.0 };
++                sum += (self.cr_t * 4300.0 * std::f32::consts::TAU).sin() * 0.012 * self.crickets * gate;
++            }
+             // Sokin musiqa: sekin-asta ttanlanadigan pentatonik notalar
+             if self.music {
+                 self.mt += dt;
+@@ -165,6 +225,15 @@ pub fn set_rain(r: f32) {
+     }
+ }
+ 
++pub fn set_ambient(wind: f32, water: f32, birds: f32, crickets: f32) {
++    if let Ok(mut g) = global().lock() {
++        g.wind = wind.clamp(0.0, 1.0);
++        g.water = water.clamp(0.0, 1.0);
++        g.birds = birds.clamp(0.0, 1.0);
++        g.crickets = crickets.clamp(0.0, 1.0);
++    }
++}
++
+ pub fn set_music(on: bool) {
+     if let Ok(mut g) = global().lock() {
+         g.music = on;
+@@ -265,7 +334,7 @@ mod tests {
+         let mut buf = vec![0i16; 4000];
+         s.render(&mut buf);
+         assert!(buf.iter().all(|&x| x == 0), "jim bo'lishi kerak");
+-        for sfx in [Sfx::Break, Sfx::Place, Sfx::Hurt, Sfx::Pickup, Sfx::Step, Sfx::Eat, Sfx::Hit, Sfx::Groan, Sfx::Craft, Sfx::Moo] {
++        for sfx in [Sfx::Break, Sfx::Place, Sfx::Hurt, Sfx::Pickup, Sfx::Step, Sfx::Eat, Sfx::Hit, Sfx::Groan, Sfx::Craft, Sfx::Moo, Sfx::StepGrass, Sfx::StepSand, Sfx::StepStone, Sfx::StepSnow, Sfx::StepWood, Sfx::Splash, Sfx::Chirp] {
+             s.trigger(sfx);
+             let mut b = vec![0i16; 2000];
+             s.render(&mut b);
+@@ -293,4 +362,24 @@ mod tests {
+         assert!(b2.iter().any(|&x| x.abs() > 200), "musiqa yo'q");
+         assert!(b2.iter().all(|&x| x.abs() < 20000));
+     }
++
++    #[test]
++    fn muhit_tovushlari() {
++        let loud = |f: &dyn Fn(&mut Synth)| {
++            let mut s = Synth::new();
++            s.music = false;
++            f(&mut s);
++            let mut b = vec![0i16; RATE as usize * 3];
++            s.render(&mut b);
++            b.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0)
++        };
++        assert_eq!(loud(&|_| {}), 0);
++        assert!(loud(&|s| s.wind = 1.0) > 300, "shamol");
++        assert!(loud(&|s| s.water = 1.0) > 300, "suv");
++        assert!(loud(&|s| s.crickets = 1.0) > 100, "chirildoq");
++        // qushlar tasodifiy: ko'p urinishda kamida bir marta chiriqlaydi
++        assert!(loud(&|s| s.birds = 1.0) > 100, "qush");
++        // yuqori shamol past shamoldan baland
++        assert!(loud(&|s| s.wind = 1.0) > loud(&|s| s.wind = 0.1));
++    }
+ }
+diff --git a/ARUmultiplatform/gigacraft/src/entity.rs b/ARUmultiplatform/gigacraft/src/entity.rs
+index 179664fd9..b168b07be 100644
+--- a/ARUmultiplatform/gigacraft/src/entity.rs
++++ b/ARUmultiplatform/gigacraft/src/entity.rs
+@@ -9,6 +9,9 @@ pub const COW: u8 = 0;
+ pub const SHEEP: u8 = 1;
+ pub const CHICKEN: u8 = 2;
+ pub const ZOMBIE: u8 = 3;
++pub const DEER: u8 = 4;
++pub const CAMEL: u8 = 5;
++pub const BEAR: u8 = 6;
+ 
+ pub fn hostile(kind: u8) -> bool {
+     kind == ZOMBIE
+@@ -19,6 +22,9 @@ pub fn max_hp(kind: u8) -> f32 {
+         COW => 10.0,
+         SHEEP => 8.0,
+         CHICKEN => 4.0,
++        DEER => 12.0,
++        CAMEL => 18.0,
++        BEAR => 30.0,
+         _ => 20.0,
+     }
+ }
+@@ -29,6 +35,9 @@ pub fn speed(kind: u8) -> f64 {
+         COW => 5.0,
+         SHEEP => 5.5,
+         CHICKEN => 6.0,
++        DEER => 9.0,
++        CAMEL => 6.0,
++        BEAR => 6.5,
+         _ => 10.5,
+     }
+ }
+@@ -39,6 +48,9 @@ pub fn size(kind: u8) -> (f64, f64) {
+         COW => (2.2, 5.0),
+         SHEEP => (2.0, 4.6),
+         CHICKEN => (1.0, 3.0),
++        DEER => (2.0, 7.5),
++        CAMEL => (2.4, 8.2),
++        BEAR => (2.8, 5.4),
+         _ => (1.2, 7.4),
+     }
+ }
+@@ -48,6 +60,9 @@ pub fn name(kind: u8) -> &'static str {
+         COW => "SIGIR",
+         SHEEP => "QO'Y",
+         CHICKEN => "TOVUQ",
++        DEER => "KIYIK",
++        CAMEL => "TUYA",
++        BEAR => "AYIQ",
+         _ => "ZOMBI",
+     }
+ }
+@@ -278,6 +293,47 @@ fn parts(kind: u8) -> Vec<Part> {
+                 ([0.8, 1.0, -1.3], [0.35, 1.0, 0.35], d, true),
+             ]
+         }
++        DEER => {
++            let t = [0.62, 0.42, 0.25];
++            let d = [0.40, 0.26, 0.15];
++            vec![
++                ([0.0, 4.2, 0.0], [0.9, 1.1, 2.0], t, false),
++                ([0.0, 6.0, 2.3], [0.45, 1.0, 0.5], t, false),
++                ([0.0, 7.0, 2.8], [0.55, 0.55, 0.8], t, false),
++                ([-0.45, 8.0, 2.6], [0.1, 0.55, 0.1], d, false),
++                ([0.45, 8.0, 2.6], [0.1, 0.55, 0.1], d, false),
++                ([-0.6, 1.9, 1.5], [0.25, 1.9, 0.25], d, true),
++                ([0.6, 1.9, 1.5], [0.25, 1.9, 0.25], d, true),
++                ([-0.6, 1.9, -1.5], [0.25, 1.9, 0.25], d, true),
++                ([0.6, 1.9, -1.5], [0.25, 1.9, 0.25], d, true),
++            ]
++        }
++        CAMEL => {
++            let t = [0.80, 0.66, 0.40];
++            let d = [0.62, 0.50, 0.30];
++            vec![
++                ([0.0, 5.0, 0.0], [1.2, 1.3, 2.4], t, false),
++                ([0.0, 6.6, -0.3], [0.8, 0.7, 0.9], t, false),
++                ([0.0, 6.4, 2.7], [0.45, 1.3, 0.45], t, false),
++                ([0.0, 7.8, 3.4], [0.55, 0.5, 0.9], t, false),
++                ([-0.7, 2.2, 1.7], [0.3, 2.2, 0.3], d, true),
++                ([0.7, 2.2, 1.7], [0.3, 2.2, 0.3], d, true),
++                ([-0.7, 2.2, -1.7], [0.3, 2.2, 0.3], d, true),
++                ([0.7, 2.2, -1.7], [0.3, 2.2, 0.3], d, true),
++            ]
++        }
++        BEAR => {
++            let w = [0.93, 0.94, 0.96];
++            vec![
++                ([0.0, 3.4, 0.0], [1.6, 1.6, 2.6], w, false),
++                ([0.0, 4.2, 3.0], [0.9, 0.9, 1.0], w, false),
++                ([0.0, 3.9, 4.0], [0.3, 0.25, 0.2], [0.10, 0.10, 0.12], false),
++                ([-1.0, 1.1, 1.8], [0.55, 1.1, 0.55], w, true),
++                ([1.0, 1.1, 1.8], [0.55, 1.1, 0.55], w, true),
++                ([-1.0, 1.1, -1.8], [0.55, 1.1, 0.55], w, true),
++                ([1.0, 1.1, -1.8], [0.55, 1.1, 0.55], w, true),
++            ]
++        }
+         CHICKEN => vec![
+             ([0.0, 1.6, 0.0], [0.7, 0.7, 0.9], [0.98, 0.98, 0.95], false),
+             ([0.0, 2.6, 0.9], [0.4, 0.45, 0.4], [0.98, 0.98, 0.95], false),
+@@ -441,7 +497,7 @@ mod tests {
+     fn quti_va_zarrachalar_cho_qqilari() {
+         let w = World::new(1);
+         let g = ground(&w, find_spawn(&w), true).unwrap();
+-        for kind in [COW, SHEEP, CHICKEN, ZOMBIE] {
++        for kind in [COW, SHEEP, CHICKEN, ZOMBIE, DEER, CAMEL, BEAR] {
+             let m = Mob::new(kind, g, d_cross(d_norm(g), [0.0, 0.0, 1.0]));
+             let mut v = Vec::new();
+             mob_vertices(&m, g, &mut v);
+diff --git a/ARUmultiplatform/gigacraft/src/game.rs b/ARUmultiplatform/gigacraft/src/game.rs
+index 7568ac11b..7164b003b 100644
+--- a/ARUmultiplatform/gigacraft/src/game.rs
++++ b/ARUmultiplatform/gigacraft/src/game.rs
+@@ -106,6 +106,12 @@ pub struct Game {
+     pub net: Option<Net>,
+     /// O'lchamlar bo'yicha oxirgi joy (boshqa o'lchamga o'tib, qaytganda tiklanadi).
+     pub dim_pos: [Option<D3>; 2],
++    /// Yil fasli [0,1): 0 — 1-yanvar. Boshlanishda haqiqiy sana bo'yicha.
++    pub season: f32,
++    /// Muhit tovushlari: (shamol, suv, qushlar, chirildoq).
++    pub ambient: [f32; 4],
++    amb_t: f32,
++    water_d: f32,
+ }
+ 
+ /// O'yin sessiyalari orasida saqlanadigan holat.
+@@ -140,6 +146,51 @@ pub fn chest_key_dim(c: &Cell, dim: u8) -> ChestKey {
+     (c.f + 8 * dim, c.u, c.v, c.r)
+ }
+ 
++/// Zamin turiga mos qadam tovushi.
++pub fn step_sfx(b: u8) -> Sfx {
++    match b {
++        SAND => Sfx::StepSand,
++        SNOW => Sfx::StepSnow,
++        STONE | COBBLE | COAL_ORE | IRON_ORE | GOLD_ORE | DIAMOND_ORE | REDSTONE_ORE | BRICK | FURNACE | GLASS | CRYSTAL => Sfx::StepStone,
++        PLANK | LOG | CRAFTING | CHEST | LOOTCHEST | ENCHANT => Sfx::StepWood,
++        _ => Sfx::StepGrass,
++    }
++}
++
++/// Yer turi va iqlimga qarab hayvon tanlaydi: o'rmonda kiyik, cho'lda tuya, qor/tundrada ayiq, dalada sigir-qo'y-tovuq.
++pub fn pick_animal(surface: u8, bio: u8, r: f32) -> Option<u8> {
++    use crate::earth;
++    match surface {
++        SAND if bio == earth::DESERT => Some(entity::CAMEL),
++        SNOW => Some(entity::BEAR),
++        GRASS if bio == earth::FOREST => Some(if r < 0.6 { entity::DEER } else if r < 0.8 { entity::COW } else { entity::SHEEP }),
++        GRASS => Some(if r < 0.3 { entity::COW } else if r < 0.6 { entity::SHEEP } else if r < 0.85 { entity::CHICKEN } else { entity::DEER }),
++        DRYGRASS => Some(if r < 0.6 { entity::DEER } else { entity::SHEEP }),
++        _ => None,
++    }
++}
++
++/// Haqiqiy sana bo'yicha yil fasli [0,1).
++pub fn real_season() -> f32 {
++    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
++    (((secs / 86400.0) % 365.2425) / 365.2425) as f32
++}
++
++/// Fasl nomi (shimoliy yarim shar) va keyingi faslning o'rtasi.
++pub fn season_name(f: f32) -> &'static str {
++    match f {
++        x if (0.17..0.42).contains(&x) => "BAHOR",
++        x if (0.42..0.67).contains(&x) => "YOZ",
++        x if (0.67..0.92).contains(&x) => "KUZ",
++        _ => "QISH",
++    }
++}
++
++fn bump(x: f32, c: f32, w: f32) -> f32 {
++    let d = (x - c).abs().min((x - c + 1.0).abs()).min((x - c - 1.0).abs());
++    (1.0 - d / w).clamp(0.0, 1.0)
++}
++
+ /// Boshlanish joyi: Toshkent (41.3° sh.k., 69.28° sh.u.) yoki eng yaqin quruqlik.
+ pub fn find_spawn(world: &World) -> D3 {
+     let g = &world.gen;
+@@ -226,6 +277,10 @@ impl Game {
+             slot: 1,
+             net: None,
+             dim_pos: [None, None],
++            season: real_season(),
++            ambient: [0.0; 4],
++            amb_t: 5.0,
++            water_d: 0.0,
+         };
+         if let Some(s) = saved {
+             g.player.pos = s.pos;
+@@ -420,6 +475,14 @@ impl Game {
+                 self.mode = Mode::Play;
+             }
+             PauseAct::Net => self.toggle_net(),
++            PauseAct::Season => {
++                self.season = match season_name(self.season) {
++                    "BAHOR" => 0.55,
++                    "YOZ" => 0.80,
++                    "KUZ" => 0.97,
++                    _ => 0.30,
++                };
++            }
+             PauseAct::SensDown => self.sens = ((self.sens - 0.2) * 10.0).round() / 10.0,
+             PauseAct::SensUp => self.sens = ((self.sens + 0.2) * 10.0).round() / 10.0,
+         }
+@@ -486,6 +549,22 @@ impl Game {
+         self.say(if dim == 1 { "OY: OG'IRLIK 6 BARAVAR KAM, HAVO YO'Q" } else { "YERGA QAYTDINGIZ" });
+     }
+ 
++    /// Quyosh og'ishi (hozirgi fasl bo'yicha).
++    pub fn decl(&self) -> f32 {
++        sky::declination(self.season)
++    }
++
++    /// Fasl o'zgarishi bo'yicha rang ko'rsatkichlari: (kuz, qish) [0,1]. Tropiklarda va Oyda fasl yo'q.
++    pub fn season_tint(&self) -> [f32; 2] {
++        if self.dim == 1 {
++            return [0.0, 0.0];
++        }
++        let up = self.player.up();
++        let f = if up[1] >= 0.0 { self.season } else { (self.season + 0.5).fract() };
++        let k = (((up[1].abs() as f32) - 0.26) / 0.35).clamp(0.0, 1.0);
++        [bump(f, 0.78, 0.10) * k, bump(f, 0.97, 0.10) * k]
++    }
++
+     pub fn eye_dir(&self) -> D3 {
+         self.player.view_dir()
+     }
+@@ -750,6 +829,8 @@ impl Game {
+                 let r = entity::rnd(&mut self.rng);
+                 let drop: Option<(Item, u32)> = match kind {
+                     entity::COW => Some((items::RAW_MEAT, 1 + (r * 2.0) as u32)),
++                    entity::DEER | entity::CAMEL => Some((items::RAW_MEAT, 2)),
++                    entity::BEAR => Some((items::RAW_MEAT, 3)),
+                     entity::SHEEP | entity::CHICKEN => Some((items::RAW_MEAT, 1)),
+                     _ if r < 0.5 => Some((items::COAL, 1)),
+                     _ if r < 0.7 => Some((items::IRON_INGOT, 1)),
+@@ -880,7 +961,11 @@ impl Game {
+             return;
+         }
+         self.player.gravity = if self.dim == 1 { 1.0 / 6.0 } else { 1.0 };
+-        self.time = (self.time + dt / DAY_SECS).fract();
++        let t1 = self.time + dt / DAY_SECS;
++        if t1 >= 1.0 {
++            self.season = (self.season + 1.0 / 365.25).fract();
++        }
++        self.time = t1.fract();
+         let r = self.layout().joy_r;
+         let mut mv = [0.0f32, 0.0];
+         for t in &self.touches {
+@@ -1038,15 +1123,29 @@ impl Game {
+         self.aim();
+     }
+ 
+-    /// Qadam tovushi.
++    /// Qadam tovushi: yer turiga qarab (o't, qum, tosh, qor, yog'och); suvda chayqalish.
+     fn footsteps(&mut self) {
+         let moved = d_len(d_sub(self.player.pos, self.step_pos));
+         self.step_pos = self.player.pos;
+-        if moved < 20.0 && self.player.on_ground && !self.player.flying {
++        if moved >= 20.0 || self.player.flying {
++            return;
++        }
++        if self.player.in_water {
++            self.water_d += moved as f32;
++            if self.water_d > 12.0 {
++                self.water_d = 0.0;
++                self.sfx.push(Sfx::Splash);
++            }
++            return;
++        }
++        if self.player.on_ground {
+             self.step_d += moved as f32;
+-            if self.step_d > 9.0 {
++            let every = if self.player.running { 7.0 } else { 9.0 };
++            if self.step_d > every {
+                 self.step_d = 0.0;
+-                self.sfx.push(Sfx::Step);
++                let up = self.player.up();
++                let under = self.world.block(&cell_at(d_sub(self.player.pos, d_mul(up, 0.3))));
++                self.sfx.push(step_sfx(under));
+             }
+         }
+     }
+@@ -1087,6 +1186,13 @@ impl Game {
+             }
+         }
+         entity::step_particles(&mut self.parts, dt);
++        self.amb_t += dt;
++        if self.amb_t >= 1.0 {
++            self.amb_t = 0.0;
++            self.update_ambient();
++        }
++        let used = self.inv.s.iter().filter(|s| !s.is_empty()).count() as f64;
++        self.player.load = if self.survival { used / items::SLOTS as f64 } else { 0.0 };
+         self.speed_t = (self.speed_t - dt).max(0.0);
+         self.jump_t = (self.jump_t - dt).max(0.0);
+         self.player.speed_mult = if self.speed_t > 0.0 { 1.4 } else { 1.0 };
+@@ -1138,6 +1244,35 @@ impl Game {
+         self.rain += (self.rain_to - self.rain) * (dt * 0.15).min(1.0);
+     }
+ 
++    /// Muhit tovushlarini hisoblaydi: shamol (balandlik, yomg'ir), suv (yaqin ko'l/daryo), qushlar (kunduz, o'rmon), chirildoq (tun).
++    fn update_ambient(&mut self) {
++        if self.dim == 1 {
++            self.ambient = [0.0; 4];
++            return;
++        }
++        let ppos = self.player.pos;
++        let up = self.player.up();
++        let night = sky::state_at(self.time, d_f32(up), self.decl()).night;
++        let wind = (0.12 + (self.player.agl / 500.0).clamp(0.0, 0.6) + self.rain as f64 * 0.3).min(1.0) as f32;
++        let (right, _, fwd) = self.player.camera_basis_flat();
++        let mut water = 0.0;
++        for k in 0..6 {
++            let a = k as f64 * std::f64::consts::TAU / 6.0;
++            let p = d_add(ppos, d_mul(d_add(d_mul(right, a.cos()), d_mul(fwd, a.sin())), 30.0));
++            let t = self.world.gen.terrain(d_norm(p));
++            if t.wl > t.h {
++                water = 0.8;
++                break;
++            }
++        }
++        let t0 = self.world.gen.terrain(d_norm(ppos));
++        let green = (t0.kind == GRASS || t0.kind == DRYGRASS) && self.player.agl < 150.0;
++        let forest = if t0.bio == crate::earth::FOREST { 1.0 } else { 0.6 };
++        let birds = if night < 0.3 && self.rain < 0.2 && green { forest } else { 0.0 };
++        let crickets = if night > 0.6 && self.rain < 0.3 && green { 0.8 } else { 0.0 };
++        self.ambient = [wind, water, birds, crickets];
++    }
++
+     fn try_spawn(&mut self) {
+         if self.dim == 1 {
+             return;
+@@ -1149,7 +1284,7 @@ impl Game {
+         if !want_hostile && passive >= 7 {
+             return;
+         }
+-        let kind = if want_hostile { entity::ZOMBIE } else { (entity::rnd(&mut self.rng) * 2.99) as u8 };
++        let mut kind = if want_hostile { entity::ZOMBIE } else { entity::COW };
+         let a = entity::rnd(&mut self.rng) * std::f32::consts::TAU;
+         let dist = if want_hostile { 40.0 + entity::rnd(&mut self.rng) as f64 * 40.0 } else { 45.0 + entity::rnd(&mut self.rng) as f64 * 65.0 };
+         let (right, _, fwd) = self.player.camera_basis_flat();
+@@ -1158,8 +1293,11 @@ impl Game {
+         let Some(g) = entity::ground(&self.world, p, true) else { return };
+         if !want_hostile {
+             let below = cell_at(d_sub(g, d_mul(d_norm(g), 0.5)));
+-            if !matches!(self.world.block(&below), GRASS | DRYGRASS) {
+-                return;
++            let bio = self.world.gen.terrain(d_norm(g)).bio;
++            let r = entity::rnd(&mut self.rng);
++            match pick_animal(self.world.block(&below), bio, r) {
++                Some(k) => kind = k,
++                None => return,
+             }
+         }
+         self.mobs.push(Mob::new(kind, g, dirv));
+@@ -1244,6 +1382,9 @@ impl Game {
+             cursor_pos: self.cursor_pos,
+             dim: self.dim,
+             slot: self.slot,
++            season: season_name(self.season),
++            stamina: self.player.stamina as f32,
++            winded: self.player.winded,
+             net: self.net.as_ref().map(|n| n.visible(self.dim)),
+             rain: self.rain,
+             status: {
+@@ -2019,6 +2160,64 @@ mod tests {
+         assert!(g.world.take_outbox().is_empty());
+     }
+ 
++    #[test]
++    fn hayvonlar_iqlimga_qarab_va_qadam_tovushi() {
++        use crate::earth;
++        assert_eq!(pick_animal(SAND, earth::DESERT, 0.5), Some(entity::CAMEL));
++        assert_eq!(pick_animal(SAND, earth::GRASS, 0.5), None, "plyajda hayvon yo'q");
++        assert_eq!(pick_animal(SNOW, earth::ICE, 0.5), Some(entity::BEAR));
++        assert_eq!(pick_animal(GRASS, earth::FOREST, 0.1), Some(entity::DEER));
++        assert_eq!(pick_animal(GRASS, earth::GRASS, 0.1), Some(entity::COW));
++        assert_eq!(pick_animal(WATER, earth::GRASS, 0.1), None);
++        assert_eq!(step_sfx(SAND), Sfx::StepSand);
++        assert_eq!(step_sfx(STONE), Sfx::StepStone);
++        assert_eq!(step_sfx(PLANK), Sfx::StepWood);
++        assert_eq!(step_sfx(SNOW), Sfx::StepSnow);
++        assert_eq!(step_sfx(GRASS), Sfx::StepGrass);
++    }
++
++    #[test]
++    fn fasl_va_quyosh_ozgaradi() {
++        let mut g = game_on_floor();
++        g.season = 0.47; // yoz
++        let summer = g.decl();
++        g.season = 0.97; // qish
++        assert!(summer > 0.3 && g.decl() < -0.3);
++        assert_eq!(season_name(0.30), "BAHOR");
++        assert_eq!(season_name(0.55), "YOZ");
++        assert_eq!(season_name(0.80), "KUZ");
++        assert_eq!(season_name(0.05), "QISH");
++        // pauza tugmasi fasllarni aylantiradi
++        g.season = 0.30;
++        let mut seen = Vec::new();
++        for _ in 0..4 {
++            g.pause_action(PauseAct::Season);
++            seen.push(season_name(g.season));
++        }
++        assert_eq!(seen, vec!["YOZ", "KUZ", "QISH", "BAHOR"]);
++        // fasl rangi: o'rta kenglikda kuzda kuz ko'rsatkichi katta, Oyda yo'q
++        g.player.pos = d_mul(crate::earth::latlon_dir(45.0, 20.0), SEA_R as f64 + 50.0);
++        g.season = 0.78;
++        assert!(g.season_tint()[0] > 0.6 && g.season_tint()[1] < 0.2);
++        g.season = 0.97;
++        assert!(g.season_tint()[1] > 0.6);
++        g.player.pos = d_mul(crate::earth::latlon_dir(2.0, 20.0), SEA_R as f64 + 50.0);
++        assert_eq!(g.season_tint(), [0.0, 0.0], "ekvatorda fasl yo'q");
++        g.dim = 1;
++        assert_eq!(g.season_tint(), [0.0, 0.0]);
++    }
++
++    #[test]
++    fn muhit_tovushlari_hisoblanadi() {
++        let mut g = game_on_floor();
++        g.update_ambient();
++        let a = g.ambient;
++        assert!(a[0] > 0.1 && a[0] <= 1.0, "shamol {a:?}");
++        g.dim = 1;
++        g.update_ambient();
++        assert_eq!(g.ambient, [0.0; 4], "Oyda havo yo'q");
++    }
++
+     #[test]
+     fn saqlashda_inventar_saqlanadi() {
+         let mut g = game_on_floor();
+diff --git a/ARUmultiplatform/gigacraft/src/lod.rs b/ARUmultiplatform/gigacraft/src/lod.rs
+index ecb98913b..63dccc71d 100644
+--- a/ARUmultiplatform/gigacraft/src/lod.rs
++++ b/ARUmultiplatform/gigacraft/src/lod.rs
+@@ -3,7 +3,7 @@
+ use crate::blocks::*;
+ use crate::gen::{Gen, CRYS_CELL, TREE_CELL};
+ use crate::math::*;
+-use crate::mesh::{push_quad, quad_normal, rel, vtx, Vertex};
++use crate::mesh::{push_quad, quad_normal, rel, vtx, vtx_m, Vertex};
+ use crate::noise::{hash2, unit as unit01};
+ use crate::planet::*;
+ 
+@@ -204,7 +204,8 @@ pub fn build_tile(g: &Gen, lf: Leaf) -> Vec<Vertex> {
+             };
+             let q = [pt(a0, b0, t), pt(a1, b0, t), pt(a1, b1, t), pt(a0, b1, t)];
+             let up = [dc[0] as f32, dc[1] as f32, dc[2] as f32];
+-            push_quad(&mut out, [vtx(rel(q[0], anchor), tcol, 1.0, up, false), vtx(rel(q[1], anchor), tcol, 1.0, up, false), vtx(rel(q[2], anchor), tcol, 1.0, up, false), vtx(rel(q[3], anchor), tcol, 1.0, up, false)]);
++            let mt = if h < wl { WATER } else { 0 };
++            push_quad(&mut out, [vtx_m(rel(q[0], anchor), tcol, 1.0, up, false, mt), vtx_m(rel(q[1], anchor), tcol, 1.0, up, false, mt), vtx_m(rel(q[2], anchor), tcol, 1.0, up, false, mt), vtx_m(rel(q[3], anchor), tcol, 1.0, up, false, mt)]);
+             let inside = d_mul(dc, t - 1.0);
+             // (qo'shni siljish, chekka nuqtalari)
+             let dirs: [(i32, i32, (i64, i64), (i64, i64)); 4] = [(-1, 0, (a0, b0), (a0, b1)), (1, 0, (a1, b0), (a1, b1)), (0, -1, (a0, b0), (a1, b0)), (0, 1, (a0, b1), (a1, b1))];
+diff --git a/ARUmultiplatform/gigacraft/src/mesh.rs b/ARUmultiplatform/gigacraft/src/mesh.rs
+index 867089f49..2f1e7296f 100644
+--- a/ARUmultiplatform/gigacraft/src/mesh.rs
++++ b/ARUmultiplatform/gigacraft/src/mesh.rs
+@@ -41,12 +41,18 @@ pub fn push_quad(parts: &mut Vec<Vec<Vertex>>, q: [Vertex; 4]) {
+ }
+ 
+ pub fn vtx(p: [f32; 3], col: [f32; 3], ao: f32, n: [f32; 3], emis: bool) -> Vertex {
++    vtx_m(p, col, ao, n, emis, 0)
++}
++
++/// Cho'qqi + material (blok raqami): shader teksturani shunga qarab chizadi. Material `n[3]` ga manfiy qilib yoziladi
++/// (musbat 127 — yorug'lik chiqaruvchi).
++pub fn vtx_m(p: [f32; 3], col: [f32; 3], ao: f32, n: [f32; 3], emis: bool, mat: u8) -> Vertex {
+     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+     let s = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
+     Vertex {
+         p,
+         c: [q(col[0]), q(col[1]), q(col[2]), q(ao)],
+-        n: [s(n[0]), s(n[1]), s(n[2]), if emis { 127 } else { 0 }],
++        n: [s(n[0]), s(n[1]), s(n[2]), if emis { 127 } else { -(mat.min(127) as i8) }],
+     }
+ }
+ 
+@@ -212,7 +218,7 @@ pub fn mesh_chunk_into(world: &World, cp: CP, anchor: D3, out: &mut MeshData) {
+                             ry = y as f64 + block_height(b) as f64;
+                         }
+                         let br = if emis { 1.0 } else { AO_LEVEL[ao[ci]] * shade };
+-                        vs[ci] = vtx(world_pos(pp[0], ry, pp[2]), col, br, nrm, emis);
++                        vs[ci] = vtx_m(world_pos(pp[0], ry, pp[2]), col, br, nrm, emis, b);
+                     }
+                     let flip = ao[0] + ao[2] < ao[1] + ao[3];
+                     let q = if flip { [vs[1], vs[2], vs[3], vs[0]] } else { vs };
+diff --git a/ARUmultiplatform/gigacraft/src/player.rs b/ARUmultiplatform/gigacraft/src/player.rs
+index 35ec98440..4cb3f805a 100644
+--- a/ARUmultiplatform/gigacraft/src/player.rs
++++ b/ARUmultiplatform/gigacraft/src/player.rs
+@@ -59,6 +59,14 @@ pub struct Player {
+     /// Iksir ta'siri: yurish tezligi va sakrash kuchi ko'paytiruvchilari.
+     pub speed_mult: f64,
+     pub jump_mult: f64,
++    /// Chidamlilik [0,1]: yugurganda kamayadi, dam olganda tiklanadi.
++    pub stamina: f64,
++    /// Charchagan: chidamlilik 30% ga qaytguncha yugurib bo'lmaydi.
++    pub winded: bool,
++    /// Ko'tarilayotgan yuk [0,1] (inventar to'laligi): to'la bo'lsa tezlik ~12% kamayadi.
++    pub load: f64,
++    last_r: f64,
++    climb_s: f64,
+ }
+ 
+ /// Joyi `pos` bo'lgan o'yinchi uchun tegma asos: (o'ng, tepa, oldinga).
+@@ -74,7 +82,7 @@ impl Player {
+         let up = d_norm(pos);
+         let r = if up[1].abs() > 0.95 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+         let heading = d_norm(d_sub(r, d_mul(up, d_dot(r, up))));
+-        Player { pos, vel: [0.0; 3], heading, pitch: 0.0, on_ground: false, flying: false, fly_level: 0, in_water: false, running: false, bob_phase: 0.0, bob_amp: 0.0, land_dip: 0.0, agl: 0.0, step_smooth: 0.0, gravity: 1.0, speed_mult: 1.0, jump_mult: 1.0 }
++        Player { pos, vel: [0.0; 3], heading, pitch: 0.0, on_ground: false, flying: false, fly_level: 0, in_water: false, running: false, bob_phase: 0.0, bob_amp: 0.0, land_dip: 0.0, agl: 0.0, step_smooth: 0.0, gravity: 1.0, speed_mult: 1.0, jump_mult: 1.0, stamina: 1.0, winded: false, load: 0.0, last_r: d_len(pos), climb_s: 0.0 }
+     }
+ 
+     pub fn up(&self) -> D3 {
+@@ -269,9 +277,42 @@ impl Player {
+             }
+             self.vel = [0.0; 3];
+         }
++        let under_early = w.block(&cell_at(d_sub(self.pos, d_mul(up, 0.2))));
+         let mag = (sx * sx + sy * sy).sqrt();
+-        self.running = mag > 0.92 && self.on_ground && !self.in_water;
++        if self.winded && self.stamina > 0.30 {
++            self.winded = false;
++        }
++        self.running = mag > 0.92 && self.on_ground && !self.in_water && !self.winded && self.stamina > 0.02;
++        if self.running {
++            self.stamina = (self.stamina - 0.16 * dt).max(0.0);
++            if self.stamina <= 0.0 {
++                self.winded = true;
++            }
++        } else {
++            self.stamina = (self.stamina + if mag > 0.1 { 0.07 } else { 0.18 } * dt).min(1.0);
++        }
++        // Tepaga chiqishda sekinlashadi (tik qiyalikda ko'proq), yuk va yumshoq zamin ham tezlikni kamaytiradi
++        let r_now = d_len(self.pos);
++        let climb = (r_now - self.last_r) / dt.max(1e-4);
++        self.last_r = r_now;
++        if self.on_ground && climb.abs() < 400.0 {
++            self.climb_s += (climb - self.climb_s) * (6.0 * dt).min(1.0);
++        } else {
++            self.climb_s *= (1.0 - 5.0 * dt).max(0.0);
++        }
++        let slope_k = 1.0 - (self.climb_s / 18.0).clamp(0.0, 0.4);
++        let load_k = 1.0 - 0.12 * self.load.clamp(0.0, 1.0);
++        let soft_k = if self.on_ground && under_early == crate::blocks::SNOW {
++            0.85
++        } else if self.on_ground && under_early == crate::blocks::SAND {
++            0.93
++        } else {
++            1.0
++        };
+         let speed = self.speed_mult
++            * slope_k
++            * load_k
++            * soft_k
+             * if self.in_water {
+                 WALK * 0.55
+             } else if self.running {
+@@ -624,4 +665,75 @@ mod odam_yurishi {
+         assert!(jump < 0.9, "kamera sakradi: {jump}");
+         assert!(min_smooth > -2.6);
+     }
++
++    #[test]
++    fn chidamlilik_yugurganda_tugaydi_va_tiklanadi() {
++        let w = World::new(1);
++        let (f, u0, v0) = (2u8, 30_000_000i64, 30_000_000i64);
++        let high = SEA_R + 9000;
++        for du in -300..300 {
++            for dv in -20..20 {
++                w.set_block(&Cell { f, u: u0 + du, v: v0 + dv, r: high - 1 }, STONE);
++            }
++        }
++        let mut p = Player::new(d_mul(dir(f, u0 as f64 + 0.5, v0 as f64 + 0.5), high as f64));
++        p.heading = d_norm(d_sub(dir(f, u0 as f64 + 5.5, v0 as f64 + 0.5), dir(f, u0 as f64 + 0.5, v0 as f64 + 0.5)));
++        for _ in 0..30 {
++            p.update(&w, &Input::default(), 0.016);
++        }
++        let run = Input { mv: [0.0, 1.0], ..Default::default() };
++        let mut ran = 0.0;
++        for _ in 0..(8.0 / 0.016) as usize {
++            p.update(&w, &run, 0.016);
++            if p.running {
++                ran += 0.016;
++            }
++        }
++        assert!(ran > 3.0 && ran < 7.5, "yugurish vaqti {ran}");
++        assert!(p.winded || p.stamina < 0.2, "charchamadi: {}", p.stamina);
++        // charchagan holatda yugurmaydi
++        p.stamina = 0.0;
++        p.winded = true;
++        p.update(&w, &run, 0.016);
++        assert!(!p.running);
++        // dam olsa tiklanadi
++        for _ in 0..(6.0 / 0.016) as usize {
++            p.update(&w, &Input::default(), 0.016);
++        }
++        assert!(p.stamina > 0.9 && !p.winded);
++    }
++
++    #[test]
++    fn yuk_va_qiyalik_tezlikni_kamaytiradi() {
++        let walk = |load: f64, slope: bool| {
++            let w = World::new(1);
++            let (f, u0, v0) = (2u8, 30_000_000i64, 30_000_000i64);
++            let high = SEA_R + 9000;
++            for du in -10..140 {
++                for dv in -10..10 {
++                    let rise = if slope && du > 6 { (du - 6) / 2 } else { 0 };
++                    for dr in 1..=(rise + 1) {
++                        w.set_block(&Cell { f, u: u0 + du, v: v0 + dv, r: high - 2 + dr }, STONE);
++                    }
++                    w.set_block(&Cell { f, u: u0 + du, v: v0 + dv, r: high - 2 }, STONE);
++                }
++            }
++            let mut p = Player::new(d_mul(dir(f, u0 as f64 + 0.5, v0 as f64 + 0.5), high as f64 - 1.0));
++            p.heading = d_norm(d_sub(dir(f, u0 as f64 + 5.5, v0 as f64 + 0.5), dir(f, u0 as f64 + 0.5, v0 as f64 + 0.5)));
++            p.load = load;
++            for _ in 0..30 {
++                p.update(&w, &Input::default(), 0.016);
++            }
++            let s = p.pos;
++            for _ in 0..(2.0 / 0.016) as usize {
++                p.update(&w, &Input { mv: [0.0, 0.9], ..Default::default() }, 0.016);
++            }
++            d_len(d_sub(p.pos, s))
++        };
++        let flat = walk(0.0, false);
++        let heavy = walk(1.0, false);
++        let hill = walk(0.0, true);
++        assert!(heavy < flat * 0.95 && heavy > flat * 0.8, "yuk: {heavy} / {flat}");
++        assert!(hill < flat * 0.93, "qiyalik: {hill} / {flat}");
++    }
+ }
+diff --git a/ARUmultiplatform/gigacraft/src/render.rs b/ARUmultiplatform/gigacraft/src/render.rs
+index 952261d2a..fccd10318 100644
+--- a/ARUmultiplatform/gigacraft/src/render.rs
++++ b/ARUmultiplatform/gigacraft/src/render.rs
+@@ -15,12 +15,12 @@ pub const SHADOW_HALF: f32 = 200.0;
+ const WORLD_VS: &str = "
+ attribute vec3 a_pos; attribute vec4 a_col; attribute vec4 a_nrm;
+ uniform mat4 u_vp; uniform vec3 u_off;
+-varying vec4 v_col; varying vec3 v_nrm; varying float v_dist; varying float v_emis; varying vec3 v_rel;
++varying vec4 v_col; varying vec3 v_nrm; varying float v_dist; varying float v_emis; varying vec3 v_rel; varying float v_mat; varying vec3 v_loc;
+ void main(){
+   vec3 p = a_pos + u_off;
+   v_rel = p;
+   gl_Position = u_vp * vec4(p, 1.0);
+-  v_col = a_col; v_nrm = a_nrm.xyz; v_emis = a_nrm.w; v_dist = length(p);
++  v_col = a_col; v_nrm = a_nrm.xyz; v_emis = max(a_nrm.w, 0.0); v_mat = max(-a_nrm.w, 0.0) * 127.0; v_loc = a_pos; v_dist = length(p);
+ }";
+ 
+ const WORLD_FS: &str = "
+@@ -29,13 +29,109 @@ precision highp float;
+ #else
+ precision mediump float;
+ #endif
+-varying vec4 v_col; varying vec3 v_nrm; varying float v_dist; varying float v_emis; varying vec3 v_rel;
++varying vec4 v_col; varying vec3 v_nrm; varying float v_dist; varying float v_emis; varying vec3 v_rel; varying float v_mat; varying vec3 v_loc;
+ uniform vec3 u_ldir; uniform vec3 u_lcol; uniform vec3 u_amb; uniform vec3 u_fog; uniform vec3 u_up;
+ uniform float u_fogk; uniform float u_alpha; uniform float u_fogamt;
+ uniform mat4 u_lvp; uniform sampler2D u_sm; uniform float u_shadow;
++uniform float u_time; uniform vec2 u_season;
+ float unpack(vec4 c){ return dot(c, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0)); }
++float h3(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
++float vn(vec3 p){
++  vec3 i = floor(p); vec3 f = fract(p); f = f * f * (3.0 - 2.0 * f);
++  float a = mix(mix(h3(i), h3(i + vec3(1.0, 0.0, 0.0)), f.x), mix(h3(i + vec3(0.0, 1.0, 0.0)), h3(i + vec3(1.0, 1.0, 0.0)), f.x), f.y);
++  float b = mix(mix(h3(i + vec3(0.0, 0.0, 1.0)), h3(i + vec3(1.0, 0.0, 1.0)), f.x), mix(h3(i + vec3(0.0, 1.0, 1.0)), h3(i + vec3(1.0, 1.0, 1.0)), f.x), f.y);
++  return mix(a, b, f.z);
++}
++bool isb(float a){ return abs(v_mat - a) < 0.5; }
++// Protsedur tekstura: blok turiga qarab (v_mat), faqat yaqinda (uzoqda xira bo'lib, miltillamasin)
++vec3 surface(vec3 col, vec3 n){
++  float nr = 1.0 - smoothstep(60.0, 200.0, v_dist);
++  float topf = dot(n, u_up);
++  float top = step(0.6, topf);
++  vec3 q = v_loc * 4.0;
++  float g = 0.0;
++  float g2 = 0.0;
++  if (nr > 0.0) { g = vn(q) - 0.5; g2 = vn(q * 2.3 + 11.0) - 0.5; }
++  float grain = (g * 0.5 + g2 * 0.35) * nr;
++  if (isb(1.0) || isb(13.0)) {
++    float bl = nr > 0.0 ? vn(vec3(q.x * 2.5, q.y * 0.6, q.z * 2.5)) - 0.5 : 0.0;
++    float k = (g + bl) * nr;
++    vec3 gcol = col * vec3(1.0 + k * 0.55, 1.0 + k * 0.85, 1.0 + k * 0.45);
++    gcol = mix(col * (1.0 + grain * 0.8), gcol, top);
++    vec3 aut = vec3(0.60, 0.52, 0.24);
++    vec3 win = vec3(0.82, 0.86, 0.88);
++    gcol = mix(gcol, aut * (0.9 + k * 0.4), u_season.x * 0.8 * top);
++    gcol = mix(gcol, win * (0.95 + k * 0.1), u_season.y * 0.8 * top);
++    return gcol;
++  }
++  if (isb(2.0)) {
++    float sp = nr > 0.0 ? step(0.78, vn(q * 1.9)) * nr : 0.0;
++    return mix(col * (1.0 + grain * 0.9), col * 0.62, sp);
++  }
++  if (isb(3.0) || isb(14.0) || isb(15.0) || isb(16.0) || isb(17.0) || isb(18.0) || isb(30.0)) {
++    vec3 sc = vec3(0.50, 0.46, 0.60);
++    float cr = nr > 0.0 ? 1.0 - smoothstep(0.0, 0.035, abs(vn(q * 0.7) - 0.5)) : 0.0;
++    if (isb(14.0)) {
++      float c1 = nr > 0.0 ? vn(q * 0.55) : 0.5;
++      float id = floor(c1 * 6.0) / 6.0;
++      float ed = abs(fract(c1 * 6.0) - 0.5) > 0.44 ? 1.0 : 0.0;
++      return col * (0.80 + id * 0.45 + grain * 0.5) * (1.0 - ed * 0.35 * nr);
++    }
++    if (isb(3.0)) return col * (1.0 + grain * 1.1 - cr * 0.30 * nr);
++    float sp = nr > 0.0 ? smoothstep(0.60, 0.70, vn(q * 1.6 + 3.0)) : 0.0;
++    return mix(sc * (1.0 + grain * 1.0 - cr * 0.25 * nr), col * (1.05 + grain * 0.5), sp);
++  }
++  if (isb(4.0)) {
++    float rp = nr > 0.0 ? vn(vec3(q.x * 0.6 + q.y * 0.4, q.y, q.z * 0.6)) - 0.5 : 0.0;
++    return col * (1.0 + grain * 1.2 + rp * 0.14 * nr);
++  }
++  if (isb(5.0)) {
++    float sp = nr > 0.0 ? step(0.965, h3(floor(q * 3.0))) * 0.16 * nr : 0.0;
++    return col * (1.0 + grain * 0.35) + vec3(sp);
++  }
++  if (isb(6.0)) {
++    float bk = nr > 0.0 ? vn(vec3(q.x * 2.0, q.y * 0.35, q.z * 2.0)) - 0.5 : 0.0;
++    float rings = nr > 0.0 ? sin(vn(q * 0.7) * 18.0) * 0.12 : 0.0;
++    return mix(col * (1.0 + bk * 0.9 * nr + grain * 0.4), col * (1.0 + rings * nr + grain * 0.3), top);
++  }
++  if (isb(7.0)) {
++    float bl = nr > 0.0 ? vn(q * 0.9) - 0.5 : 0.0;
++    vec3 lc = col * (1.0 + bl * 0.55 * nr + grain * 0.6);
++    lc = mix(lc, vec3(0.88, 0.48, 0.14) * (0.85 + bl * 0.5), u_season.x * 0.85);
++    lc = mix(lc, vec3(0.52, 0.40, 0.38) * (0.9 + bl * 0.3), u_season.y * 0.7);
++    return lc;
++  }
++  if (isb(12.0)) {
++    float rows = dot(v_loc, u_up) * 4.0;
++    float line = step(fract(rows), 0.07);
++    float lt = step(fract(v_loc.x * 2.0), 0.07);
++    float ln = mix(line, lt, top) * nr;
++    return col * (1.0 + grain * 0.8 - ln * 0.30);
++  }
++  if (isb(20.0)) {
++    vec3 t = cross(u_up, n);
++    float tl = length(t);
++    if (tl > 0.2 && top < 0.5) {
++      t = t / tl;
++      float row = dot(v_loc, u_up) * 2.0;
++      float cx = dot(v_loc, t) * 1.2 + 0.5 * floor(row);
++      float m = clamp(step(fract(row), 0.09) + step(fract(cx), 0.07), 0.0, 1.0) * nr;
++      return mix(col * (1.0 + grain * 0.7), vec3(0.78, 0.74, 0.70), m);
++    }
++    return col * (1.0 + grain * 0.7);
++  }
++  return col * (1.0 + grain * 0.5);
++}
+ void main(){
+   vec3 n = normalize(v_nrm);
++  bool water = isb(9.0);
++  if (water) {
++    vec3 p = v_loc * 0.9;
++    float t = u_time;
++    vec3 pert = vec3(vn(p + vec3(t * 0.6, 0.0, t * 0.35)), vn(p * 1.7 + vec3(0.0, t * 0.8, t * 0.5) + 5.0), vn(p * 1.3 + vec3(t * 0.4, t * 0.3, 0.0) + 9.0)) - 0.5;
++    float wk = 0.55 * (1.0 - smoothstep(150.0, 600.0, v_dist));
++    n = normalize(n + (pert - n * dot(pert, n)) * wk);
++  }
+   float ndl = max(dot(n, u_ldir), 0.0);
+   float sh = 1.0;
+   if (u_shadow > 0.5 && ndl > 0.0 && v_emis < 0.5) {
+@@ -52,16 +148,28 @@ void main(){
+     }
+   }
+   vec3 light = u_amb * (0.72 + 0.28 * dot(n, u_up)) * 0.85 + u_lcol * ndl * 0.62 * sh;
+-  vec3 c = v_col.rgb * light * v_col.a;
++  vec3 albedo = v_emis > 0.5 ? v_col.rgb : surface(v_col.rgb, normalize(v_nrm));
++  vec3 c = albedo * light * v_col.a;
+   c = mix(c, v_col.rgb * 1.1, v_emis);
++  float alpha = u_alpha;
++  vec3 vd = normalize(v_rel);
++  if (water) {
++    vec3 V = -vd;
++    float fr = pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 3.0);
++    vec3 skyc = u_fog * 1.05 + u_amb * 0.1;
++    c = mix(c, skyc, 0.12 + fr * 0.55);
++    vec3 R = reflect(-u_ldir, n);
++    float sp = pow(max(dot(R, V), 0.0), 90.0) * step(0.0, dot(u_ldir, u_up));
++    c += u_lcol * sp * 0.9 * u_fogamt;
++    alpha = clamp(u_alpha + fr * 0.3, 0.0, 1.0);
++  }
+   float d = clamp((v_dist * u_fogk - 0.55) / 0.45, 0.0, 1.0);
+   float f = d * d * (3.0 - 2.0 * d) * u_fogamt;
+   // Havo tumani: uzoqdagi narsa ko'kimtir, quyosh tomonda yorug'roq (Rayleigh/Mie sochilishi)
+-  vec3 vd = normalize(v_rel);
+   float sun = pow(max(dot(vd, u_ldir), 0.0), 5.0);
+   vec3 fogc = u_fog * vec3(0.92, 0.98, 1.06) + u_lcol * sun * 0.35;
+   c = mix(c, c * vec3(0.86, 0.93, 1.08), min(f * 1.4, 1.0));
+-  gl_FragColor = vec4(mix(c, fogc, f), u_alpha);
++  gl_FragColor = vec4(mix(c, fogc, f), alpha);
+ }";
+ 
+ const SH_VS: &str = "
+@@ -93,7 +201,9 @@ precision mediump float;
+ varying vec2 v_p;
+ uniform vec3 u_fwd; uniform vec3 u_right; uniform vec3 u_camup; uniform vec2 u_tan;
+ uniform vec3 u_sun; uniform vec3 u_top; uniform vec3 u_hor; uniform float u_night;
+-uniform vec3 u_up; uniform float u_atm; uniform float u_sunel;
++uniform vec3 u_up; uniform float u_atm; uniform float u_sunel; uniform float u_time; uniform float u_cover;
++float h2(vec2 p){ p = fract(p * vec2(0.1031, 0.1030)); p += dot(p, p.yx + 33.33); return fract((p.x + p.y) * p.x); }
++float vn2(vec2 p){ vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f); return mix(mix(h2(i), h2(i + vec2(1.0, 0.0)), f.x), mix(h2(i + vec2(0.0, 1.0)), h2(i + vec2(1.0, 1.0)), f.x), f.y); }
+ float hash(vec3 p){ p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+ void main(){
+   vec3 d = normalize(u_fwd + u_right * (v_p.x * u_tan.x) + u_camup * (v_p.y * u_tan.y));
+@@ -114,6 +224,21 @@ void main(){
+     float tw = smoothstep(0.35, 0.0, length(fract(q) - 0.5));
+     col += vec3(1.0) * star * tw * sa * (0.5 + 0.5 * hash(id + 7.0));
+   }
++  if (h > 0.01 && u_atm > 0.05) {
++    vec3 ax = abs(u_up.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
++    vec3 t1 = normalize(cross(u_up, ax)); vec3 t2 = cross(u_up, t1);
++    vec2 p = vec2(dot(d, t1), dot(d, t2)) / max(h, 0.06) * 0.55 + vec2(u_time * 0.012, u_time * 0.004);
++    float f = 0.0; float am = 0.5;
++    for (int i = 0; i < 4; i++) { f += am * vn2(p); p = p * 2.03 + 17.0; am *= 0.5; }
++    float dens = smoothstep(0.62 - u_cover * 0.30, 0.86 - u_cover * 0.30, f);
++    dens *= smoothstep(0.01, 0.16, h);
++    float day = clamp(u_sunel * 2.5 + 0.35, 0.0, 1.0);
++    vec3 cc = mix(vec3(0.05, 0.06, 0.10), vec3(1.0), day);
++    cc = mix(cc, u_hor * 1.1, 0.25 * (1.0 - day * day));
++    cc = mix(cc, cc * vec3(0.55, 0.58, 0.64), u_cover * 0.8);
++    cc *= 1.0 - dens * 0.25;
++    col = mix(col, cc, dens * 0.92 * u_atm);
++  }
+   gl_FragColor = vec4(col, 1.0);
+ }";
+ 
+@@ -195,6 +320,12 @@ pub struct View {
+     pub h: i32,
+     pub near: f32,
+     pub far: f32,
++    /// Sekundlarda (to'lqin va bulut harakati uchun).
++    pub time: f32,
++    /// Bulut qoplami [0,1].
++    pub cover: f32,
++    /// Fasl ranglari: (kuz, qish).
++    pub season: [f32; 2],
+ }
+ 
+ #[derive(Default, Clone, Copy, Debug)]
+@@ -215,6 +346,8 @@ struct WorldU {
+     alpha: i32,
+     up: i32,
+     fogamt: i32,
++    time: i32,
++    season: i32,
+     lvp: i32,
+     sm: i32,
+     shadow: i32,
+@@ -225,7 +358,7 @@ pub struct Renderer {
+     sky_p: u32,
+     hud_p: u32,
+     wu: WorldU,
+-    sky_u: [i32; 12],
++    sky_u: [i32; 13],
+     hud_scr: i32,
+     hud_tex_u: i32,
+     idx: u32,
+@@ -267,12 +400,14 @@ impl Renderer {
+             alpha: uniform(world_p, "u_alpha"),
+             up: uniform(world_p, "u_up"),
+             fogamt: uniform(world_p, "u_fogamt"),
++            time: uniform(world_p, "u_time"),
++            season: uniform(world_p, "u_season"),
+             lvp: uniform(world_p, "u_lvp"),
+             sm: uniform(world_p, "u_sm"),
+             shadow: uniform(world_p, "u_shadow"),
+         };
+-        let names = ["u_fwd", "u_right", "u_camup", "u_tan", "u_sun", "u_top", "u_hor", "u_night", "u_up", "u_atm", "u_sunel", "u_unused"];
+-        let mut sky_u = [0i32; 12];
++        let names = ["u_fwd", "u_right", "u_camup", "u_tan", "u_sun", "u_top", "u_hor", "u_night", "u_up", "u_atm", "u_sunel", "u_time", "u_cover"];
++        let mut sky_u = [0i32; 13];
+         for (i, n) in names.iter().enumerate() {
+             sky_u[i] = uniform(sky_p, n);
+         }
+@@ -382,6 +517,8 @@ impl Renderer {
+             glUniform3f(self.sky_u[8], v.local_up.x, v.local_up.y, v.local_up.z);
+             glUniform1f(self.sky_u[9], v.atm);
+             glUniform1f(self.sky_u[10], sky.sun.dot(v.local_up));
++            glUniform1f(self.sky_u[11], v.time);
++            glUniform1f(self.sky_u[12], v.cover);
+             glBindBuffer(ARRAY_BUFFER, self.sky_vbo);
+             glEnableVertexAttribArray(0);
+             glDisableVertexAttribArray(1);
+@@ -464,6 +601,8 @@ impl Renderer {
+             glUniform1i(self.wu.sm, 1);
+             glActiveTexture(TEXTURE0);
+             glUniform1f(self.wu.fogamt, v.atm);
++            glUniform1f(self.wu.time, v.time);
++            glUniform2f(self.wu.season, v.season[0], v.season[1]);
+             glBindBuffer(ELEMENT_ARRAY_BUFFER, self.idx);
+         }
+         let mut vis: Vec<(&GpuMesh, [f32; 3])> = Vec::with_capacity(meshes.len());
+diff --git a/ARUmultiplatform/gigacraft/src/sky.rs b/ARUmultiplatform/gigacraft/src/sky.rs
+index dade0776e..29f7c1bd0 100644
+--- a/ARUmultiplatform/gigacraft/src/sky.rs
++++ b/ARUmultiplatform/gigacraft/src/sky.rs
+@@ -52,11 +52,38 @@ pub fn airless(mut s: SkyState) -> SkyState {
+     s
+ }
+ 
+-/// `t` — kun fazasi [0,1); `up` — o'yinchi turgan joyning "tepa" yo'nalishi (sayyora markazidan tashqariga).
+-/// t=0.25 va up=(0,1,0) bo'lsa — tush.
++/// Quyosh og'ish burchagi (radian): yil fasli `f` (0 — 1-yanvar) bo'yicha, o'q og'ishi 23.44°.
++pub fn declination(f: f32) -> f32 {
++    23.44f32.to_radians() * (std::f32::consts::TAU * (f - 0.2192)).sin()
++}
++
++/// Quyosh yo'nalishi (dunyo koordinatalarida) joyning mahalliy quyosh vaqti `t` (0.25 — tush) va yil faslidagi og'ishi `decl` bo'yicha.
++/// Sayyora o'qi — y: qutbda yarim yillik kun/tun, ekvatorda teng kun-tun, kenglikka qarab kun uzunligi o'zgaradi.
++pub fn sun_dir(t: f32, up: V3, decl: f32) -> V3 {
++    let mut north = v3(0.0, 1.0, 0.0) - up * up.y;
++    if north.len() < 1e-4 {
++        north = v3(1.0, 0.0, 0.0) - up * up.x;
++    }
++    let north = north.norm();
++    let east = north.cross(up).norm();
++    let sin_phi = up.y.clamp(-1.0, 1.0);
++    let cos_phi = (1.0 - sin_phi * sin_phi).max(0.0).sqrt();
++    let h = (t - 0.25) * std::f32::consts::TAU;
++    let (sd, cd) = (decl.sin(), decl.cos());
++    let e = -cd * h.sin();
++    let n = sd * cos_phi - cd * sin_phi * h.cos();
++    let u = sin_phi * sd + cos_phi * cd * h.cos();
++    (east * e + north * n + up * u).norm()
++}
++
++/// Teng kun-tun (mart) uchun osmon holati.
+ pub fn state(t: f32, up: V3) -> SkyState {
+-    let a = t * std::f32::consts::TAU;
+-    let sun = v3(a.cos() * 0.85, a.sin(), 0.35).norm();
++    state_at(t, up, 0.0)
++}
++
++/// `t` — mahalliy quyosh vaqti [0,1) (0.25 — tush); `up` — o'yinchi turgan joyning "tepa" yo'nalishi (sayyora markazidan tashqariga); `decl` — fasl.
++pub fn state_at(t: f32, up: V3, decl: f32) -> SkyState {
++    let sun = sun_dir(t, up, decl);
+     let e = sun.dot(up);
+     let day = smoothstep(-0.08, 0.30, e);
+     let set = (1.0 - (e * 3.2).abs()).clamp(0.0, 1.0);
+@@ -104,30 +131,36 @@ pub const PHASE_NIGHT: f32 = 0.78;
+ mod tests {
+     use super::*;
+ 
++    /// Toshkent kengligi (41°) atrofidagi "tepa" yo'nalishi.
++    fn mid_lat() -> V3 {
++        let la = 41.0f32.to_radians();
++        v3(la.cos(), la.sin(), 0.0)
++    }
++
+     #[test]
+     fn tush_yorqin_tun_qorongi() {
+-        let up = v3(0.0, 1.0, 0.0);
++        let up = mid_lat();
+         let d = state(0.25, up);
+         let n = state(0.75, up);
+         let lum = |c: [f32; 3]| c[0] + c[1] + c[2];
+         assert!(lum(d.amb) > lum(n.amb) * 1.5);
+         assert!(lum(d.top) > lum(n.top) * 5.0);
+         assert!(d.night < 0.01 && n.night > 0.99);
+-        assert!(d.light_dir.y > 0.9);
++        assert!(d.light_dir.dot(mid_lat()) > 0.7);
+         // tunda yorug'lik — oydan (yuqoridan)
+-        assert!(n.light_dir.y > 0.5, "oy yuqorida bo'lishi kerak: {:?}", n.light_dir);
++        assert!(n.light_dir.dot(mid_lat()) > 0.5, "oy yuqorida bo'lishi kerak: {:?}", n.light_dir);
+     }
+ 
+     #[test]
+     fn kechqurun_gorizont_issiq() {
+-        let s = state(PHASE_SUNSET + 0.03, v3(0.0, 1.0, 0.0));
++        let s = state(PHASE_SUNSET + 0.03, mid_lat());
+         assert!(s.hor[0] > s.hor[2], "kechqurun gorizont qizg'ish: {:?}", s.hor);
+     }
+ 
+     #[test]
+     fn rangler_oraliqda() {
+         for i in 0..200 {
+-            let s = state(i as f32 / 200.0, v3(0.0, 1.0, 0.0));
++            let s = state(i as f32 / 200.0, mid_lat());
+             for c in s.top.iter().chain(s.hor.iter()).chain(s.amb.iter()).chain(s.light_col.iter()).chain(s.fog.iter()) {
+                 assert!((0.0..=1.2).contains(c), "t={} c={}", i, c);
+             }
+@@ -137,11 +170,39 @@ mod tests {
+ 
+     #[test]
+     fn yomgirda_osmon_xira() {
+-        let d = state(PHASE_DAY, v3(0.0, 1.0, 0.0));
++        let d = state(PHASE_DAY, mid_lat());
+         let r = overcast(d, 1.0);
+         assert!(r.light_col[0] < d.light_col[0] * 0.8);
+         assert!((r.top[0] - r.top[2]).abs() < (d.top[0] - d.top[2]).abs(), "kulrangga o'tishi kerak");
+         let same = overcast(d, 0.0);
+         assert_eq!(same.top, d.top);
+     }
++
++    #[test]
++    fn haqiqiy_quyosh_kenglik_va_fasl() {
++        let at = |lat: f32| {
++            let la = lat.to_radians();
++            v3(la.cos(), la.sin(), 0.0)
++        };
++        let elev = |t: f32, lat: f32, decl: f32| sun_dir(t, at(lat), decl).dot(at(lat));
++        let eq = 0.0;
++        let sum = declination(0.47); // iyun oxiri
++        let win = declination(0.97); // dekabr
++        assert!((sum.to_degrees() - 23.4).abs() < 1.0 && (win.to_degrees() + 23.4).abs() < 1.0);
++        // ekvatorda tush: deyarli tepada
++        assert!(elev(0.25, 0.0, eq) > 0.99);
++        // Toshkentda yozda tush balandroq, qishda past
++        assert!(elev(0.25, 41.0, sum) > elev(0.25, 41.0, win) + 0.5);
++        // qutbda yozda yarim tunda ham quyosh ufqdan tepada (qutb kuni), qishda tushda ham pastda
++        assert!(elev(0.75, 80.0, sum) > 0.0, "qutb kuni");
++        assert!(elev(0.25, 80.0, win) < 0.0, "qutb tuni");
++        // kun uzunligi: qishda Toshkentda tun uzun
++        let day_len = |decl: f32| (0..240).filter(|&i| elev(i as f32 / 240.0, 41.0, decl) > 0.0).count();
++        assert!(day_len(sum) > day_len(win) + 30, "{} {}", day_len(sum), day_len(win));
++        assert!((day_len(eq) as i32 - 120).abs() < 8);
++        // quyosh yo'nalishi birlik vektor
++        for i in 0..50 {
++            assert!((sun_dir(i as f32 / 50.0, at(41.0), sum).len() - 1.0).abs() < 1e-4);
++        }
++    }
+ }
+diff --git a/ARUmultiplatform/gigacraft/src/ui.rs b/ARUmultiplatform/gigacraft/src/ui.rs
+index 679d51606..60950701e 100644
+--- a/ARUmultiplatform/gigacraft/src/ui.rs
++++ b/ARUmultiplatform/gigacraft/src/ui.rs
+@@ -118,6 +118,8 @@ pub enum PauseAct {
+     Slot,
+     /// Mahalliy tarmoq (Wi-Fi) ko'p o'yinchi.
+     Net,
++    /// Yil faslini almashtirish.
++    Season,
+ }
+ 
+ pub struct Layout {
+@@ -233,14 +235,15 @@ impl Layout {
+             PauseAct::SensDown => (px + m, row(4.0), 150.0 * s, bh),
+             PauseAct::SensUp => (px + m + inner - 150.0 * s, row(4.0), 150.0 * s, bh),
+             PauseAct::Dim => (px + m, row(5.0), inner, bh),
+-            PauseAct::Slot => (px + m, row(6.0), inner, bh),
++            PauseAct::Slot => (px + m, row(6.0), inner / 2.0 - 8.0 * s, bh),
++            PauseAct::Season => (px + m + inner / 2.0 + 8.0 * s, row(6.0), inner / 2.0 - 8.0 * s, bh),
+             PauseAct::Net => (px + m, row(7.0), inner, bh),
+         }
+     }
+ 
+     pub fn pause_at(&self, x: f32, y: f32) -> Option<PauseAct> {
+         use PauseAct::*;
+-        [Resume, Mode, Quality, Day, Sunset, Night, SensDown, SensUp, Dim, Slot, Net].into_iter().find(|&a| {
++        [Resume, Mode, Quality, Day, Sunset, Night, SensDown, SensUp, Dim, Slot, Season, Net].into_iter().find(|&a| {
+             let (bx, by, bw, bh) = self.pause_btn(a);
+             x >= bx && x <= bx + bw && y >= by && y <= by + bh
+         })
+@@ -355,6 +358,9 @@ pub struct UiState {
+     pub status: String,
+     pub dim: u8,
+     pub slot: u8,
++    pub season: &'static str,
++    pub stamina: f32,
++    pub winded: bool,
+     /// Tarmoq yoqilgan bo'lsa — ko'rinayotgan boshqa o'yinchilar soni.
+     pub net: Option<usize>,
+     pub sel: usize,
+@@ -492,6 +498,13 @@ pub fn draw(h: &mut Hud, l: &Layout, u: &UiState) {
+     if u.rain > 0.02 {
+         draw_rain(h, l, u.rain);
+     }
++    if u.stamina < 0.995 {
++        let (bw, bh) = (360.0 * s, 9.0 * s);
++        let (bx, by) = ((l.w - bw) * 0.5, l.slot_y - 34.0 * s);
++        h.rrect(bx, by, bw, bh, bh * 0.5, rgba(0, 0, 0, 150));
++        let col = if u.winded { rgba(230, 120, 40, 255) } else { rgba(110, 220, 120, 255) };
++        h.rrect(bx, by, (bw * u.stamina.clamp(0.0, 1.0)).max(bh), bh, bh * 0.5, col);
++    }
+     if u.survival {
+         draw_vitals(h, l, u);
+     }
+@@ -732,7 +745,8 @@ fn draw_pause(h: &mut Hud, l: &Layout, u: &UiState) {
+     b(h, PauseAct::Sunset, "KECH", dark, WHITE);
+     b(h, PauseAct::Night, "TUN", dark, WHITE);
+     b(h, PauseAct::Dim, if u.dim == 0 { "OLCHAM: YER  ->  OY" } else { "OLCHAM: OY  ->  YER" }, dark, WHITE);
+-    b(h, PauseAct::Slot, &format!("SAQLASH O'RNI: {}  (KEYINGISI)", u.slot), dark, WHITE);
++    b(h, PauseAct::Slot, &format!("O'RIN: {} (KEYINGI)", u.slot), dark, WHITE);
++    b(h, PauseAct::Season, &format!("FASL: {}", u.season), dark, WHITE);
+     let net_label = match u.net {
+         None => "TARMOQ: O'CHIQ".to_string(),
+         Some(n) => format!("TARMOQ: YOQILGAN  ({} O'YINCHI)", n),
+@@ -811,7 +825,7 @@ mod tests {
+     fn menyu_va_blok_oynasi_tugmalari() {
+         for &(w, h) in &[(2400.0f32, 1080.0f32), (1600.0, 720.0)] {
+             let l = Layout::new(w, h);
+-            for a in [PauseAct::Resume, PauseAct::Mode, PauseAct::Quality, PauseAct::Day, PauseAct::Sunset, PauseAct::Night, PauseAct::SensDown, PauseAct::SensUp, PauseAct::Dim, PauseAct::Slot, PauseAct::Net] {
++            for a in [PauseAct::Resume, PauseAct::Mode, PauseAct::Quality, PauseAct::Day, PauseAct::Sunset, PauseAct::Night, PauseAct::SensDown, PauseAct::SensUp, PauseAct::Dim, PauseAct::Slot, PauseAct::Season, PauseAct::Net] {
+                 let (x, y, bw, bh) = l.pause_btn(a);
+                 assert_eq!(l.pause_at(x + bw * 0.5, y + bh * 0.5), Some(a));
+                 let (px, py, pw, ph) = l.panel();
+diff --git a/ARUmultiplatform/gigacraft/tests/shots.rs b/ARUmultiplatform/gigacraft/tests/shots.rs
+index 6be2dd6be..77030239c 100644
+--- a/ARUmultiplatform/gigacraft/tests/shots.rs
++++ b/ARUmultiplatform/gigacraft/tests/shots.rs
+@@ -84,7 +84,7 @@ fn ekran_rasmlari() {
+         let img = app.read_pixels(W, H);
+         save("0-oyoq-ostida", &img);
+         let up = gigacraft::math::d_f32(app.game.player.up());
+-        let hor = sky::state(app.game.time, up).hor;
++        let hor = sky::state_at(app.game.time, up, app.game.decl()).hor;
+         let hor = [hor[0] * 255.0, hor[1] * 255.0, hor[2] * 255.0];
+         assert!(app.game.player.altitude() > 200.0, "sinov baland joyda bo'lishi kerak: {}", app.game.player.altitude());
+         let mut ground = 0;
+diff --git a/KEYINGI_VAZIFA.md b/KEYINGI_VAZIFA.md
+index 1d34fa72d..0845d91dc 100644
+--- a/KEYINGI_VAZIFA.md
++++ b/KEYINGI_VAZIFA.md
+@@ -7881,3 +7881,13 @@ Ikkinchi qism:
+ - `net.rs`: bitta Wi-Fi'dagi ko'p o'yinchi (UDP broadcast, port 47321): o'yinchi holati va blok o'zgarishlari; server kerak emas. Manifestda INTERNET ruxsati.
+ 
+ Qilinmagan: sehr/iksir uchun alohida retsept kitobi, internet orqali (Wi-Fi'dan tashqari) ko'p o'yinchi, Nether/End kabi qo'shimcha o'lchamlar (faqat Oy).
++
++Uchinchi qism (realizm):
++- Shader (`render.rs`): protsedur teksturalar (o't, tuproq, tosh, bruschatka, ruda, qum, qor, tana, barg, taxta, g'isht) — blok raqami `Vertex.n[3]` ga manfiy qilib yoziladi (`mesh::vtx_m`), musbat 127 — yorug'lik chiqaruvchi; suv to'lqini, Fresnel aks, quyosh yaltirashi (LOD suv ham, `lod.rs`); osmonda bulutlar (qoplam yomg'irga qarab); fasl ranglari (kuz — barg/o't, qish — oq).
++- `sky::sun_dir/state_at`: haqiqiy quyosh — kenglik, o'q og'ishi (23.44°), fasl (`Game.season`, boshlanishda haqiqiy sana); pauza menyusida FASL tugmasi.
++- `audio.rs`: zamin turiga qarab qadam (o't/qum/tosh/qor/yog'och), suvda chayqalish, muhit: shamol, daryo/ko'l, qushlar (kunduz, o'tloq/o'rmon), chirildoq (tun); Oyda jimlik.
++- Hayvonlar iqlimga qarab (`game::pick_animal`): o'rmonda kiyik, cho'lda tuya, qor/muzda ayiq, dalada sigir/qo'y/tovuq.
++- Harakat: chidamlilik (yugurish ~6 s), tepaga chiqishda sekinlashish, yuk (inventar to'laligi) va qor/qum ta'siri.
++
++Qilinmagan: aniqroq dunyo xaritasi (tashqi ma'lumot kerak), OpenStreetMap shaharlari, kichikroq bloklar (telefon uchun og'ir).
++
+-- 
+2.43.0
+
