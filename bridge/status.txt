@@ -1,1 +1,1 @@
-tayyor 2026-11-28T16:33:57Z
+OK: 1 ta patch yuborildi, 469af1d3 GigaCraft realizm: teksturalar, suv to'lqini, bulutlar, haqiqiy quyosh va fasllar, muhit tovushlari, iqlimga mos hayvonlar, chidamlilik va qiyalik
